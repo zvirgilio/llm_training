@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F 
 
-from llm_modules import ModelConfig, Block
+from llm_modules import ModelConfig, TransformerBlock
 
 
 
@@ -51,6 +51,7 @@ class LLMModel(nn.Module):
 		sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard the mask/buffer
 
 		# init a huggerface/transformers model
+		print('Loading HF model weights')
 		model_hf = GPT2LMHeadModel.from_pretrained(model_type)
 		sd_hf = model_hf.state_dict()
 
@@ -86,14 +87,8 @@ class LLMModel(nn.Module):
 
 
 def main():
-	gpt2Config = ModelConfig
-
-	# set the configuration to match gp2 sizes so we can load the weights
-	gpt2Config.block_size = 1024		# max sequence length
-	gpt2Config.vocab_size = 50257		# number of tokens
-	gpt2Config.n_layer = 1024			# number of layers
-	gpt2Config.n_head = 12  			# number of heads
-	gpt2Config.n_embed = 768 			# embedding dimensions
+	model = LLMModel.from_pretrained('gpt2')
+	print("didn't crash")
 
 
 
