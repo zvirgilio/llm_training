@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F 
-
+import time 
 from llm_modules import ModelConfig, TransformerBlock
 
 
@@ -23,6 +23,7 @@ class LLMModel(nn.Module):
 		self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
 
 		#weight sharing between encoder and head layer
+		#idea is that similar semantic tokens in the encoding should be predicted with similar probability in output
 		self.transformer.wte.weight = self.lm_head.weight #orpahns wte.weight tensor and torch should clean it up
 
 		# initialize params to match gpt 2
@@ -31,7 +32,11 @@ class LLMModel(nn.Module):
 	def _init_weights(self, module):
 		if isinstance(module, nn.Linear):
 			# std to 0.02 roughly matches 1/sqrt(N), the number of features incoming in gpt2 models (between 768 to 1600)
-			torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+			# if adding to resid stream, scale by 1/sqrt(n layers)
+			std = 0.02
+			if hasattr(module, 'SCALE_INIT'):
+				std *= (2 * self.config.n_layer) ** -0.5 # 2 factor is because each block adds to resid stream twice 1. attn, 2. mlp
+			torch.nn.init.normal_(module.weight, mean=0.0, std=std)
 			if module.bias is not None:
 				torch.nn.init.zeros_(module.bias)
 		elif isinstance(module, nn.Embedding):
@@ -122,8 +127,40 @@ class LLMModel(nn.Module):
 
 		return model
 
+#----------------------------------------------------------------------------------------------
+import tiktoken
+class DataLoaderMini:
+	def __init__(self, B, T):
+		self.B = B
+		self.T = T
 
+		with open('input.txt', 'r') as f:
+			text = f.read()
+		enc = tiktoken.get_encoding('gpt2') #initialize the encoder
+		tokens = enc.encode(text)			#encode the data
+		self.tokens = torch.tensor(tokens)	#save as a torch tensor
+		print(f"Loaded {len(self.tokens)} tokens")
+		print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
+		# how many tokens along in the text
+		self.current_position=0
+
+	def next_batch(self):
+		B, T = self.B, self.T
+		buf = self.tokens[self.current_position:self.current_position+(B*T)+1] #store one extra token for ground truth of prediction
+		x = (buf[:-1]).view(B, T)
+		y = (buf[1:]).view(B, T)
+
+		#update the current position in the dataset
+		self.current_position += B*T 
+
+		#start over if we reach the end of the data
+		if self.current_position + (B*T) + 1 > len(self.tokens):
+			self.current_position = 0
+
+		return x, y 
+
+#--------------------------------------------------------------------------------------------------
 def get_device():
 	device = "cpu"
 	if torch.cuda.is_available():
@@ -137,32 +174,36 @@ def get_device():
 def main():
 	device = torch.device(get_device())
 
+	#initialize a data loader
+	train_loader = DataLoaderMini(B=4, T=256)
+
 	num_return_sequences = 5 
 	max_length = 30
 
 	# model = LLMModel.from_pretrained('gpt2')
-	model = LLMModel(ModelConfig())
-	
+	model = LLMModel(ModelConfig(vocab_size=50304))	 #has high powers of 2, vs original vocab size
+	# new possible 'fake' output dimensions will learn to have logits of 0 since they never appear
 	model.eval()
 	model.to(device)
+	# compile offered no appreciable speedup on my mac with m1 chip
+	# model = torch.compile(model, mode="default")
 
-	#tokenize the prompt using tiktoken
-	import tiktoken
-	enc = tiktoken.get_encoding('gpt2')
-	with open('input.txt', 'r') as f:
-		text = f.read()
-	text = text[:1000]
-	tokens = enc.encode(text)
-	B, T = 4, 32
-	buf = torch.tensor(tokens[:B*T+1], device=device)
-	x = buf[:-1].view(B, T)
-	y = buf[1:].view(B, T)
+	#optimizer
+	optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+	for i in range(50):
+		t0 = time.time()
+		x, y = train_loader.next_batch()
+		x, y = x.to(device), y.to(device)
+		optimizer.zero_grad()
+		logits, loss = model(x,y)
+		loss.backward()
+		optimizer.step()
+		torch.mps.synchronize()
+		t1 = time.time()
+		dt = (t1-t0)*1000
+		tokens_per_sec = (train_loader.B * train_loader.T) / (t1-t0)
+		print(f"step {i}, loss = {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
-	# x.to(device)
-	# y.to(device)
-
-	logits, loss = model(x, y)
-	print(loss)
 	import sys; sys.exit(0)
 
 	# generate 
